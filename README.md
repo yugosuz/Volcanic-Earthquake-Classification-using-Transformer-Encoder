@@ -3,5 +3,6 @@ Volcanic Earthquake Classification using Transformer Encoder and Its Interpretab
 
 - train.py : train code
 - summary.py : show summary
-- stations.csv : station list
 - weights/* : model weight file
+- stations.csv : station list
+- input data canbe downloaded from https://x.gd/Ro0td

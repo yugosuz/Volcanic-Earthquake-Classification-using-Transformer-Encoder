@@ -1,5 +1,6 @@
 # Volcanic-Earthquake-Classification-using-Transformer-Encoder
 Volcanic Earthquake Classification using Transformer Encoder and Its Interpretability Evaluation
+DOI: 10.22541/essoar.171378786.62639546/v1
 
 - train.py : train code
 - summary.py : show summary

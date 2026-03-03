@@ -1,146 +1,103 @@
-# モジュールのインポート
+from __future__ import annotations
+
+import argparse
+
 import numpy as np
 import pandas as pd
 import torch
-from torch import nn
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
 from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score, balanced_accuracy_score
-from collections import OrderedDict
-import argparse
-from modules.dataset import *
-from modules.transformer_rpr import *
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+from modules.dataset import PhaseDataset
+from modules.model_rpr import RPRClassifier, strip_data_parallel_prefix
 
-weight_path = ''
 
-base_path = 'data/'
-
-parser = argparse.ArgumentParser(description='window size, stride, channel sizeを指定して実行する')
-
-parser.add_argument('num_batch', type=int)
-parser.add_argument('window_size', type=int)
-parser.add_argument('stride', type=int)
-parser.add_argument('channel_size', type=int)
-parser.add_argument('-a', '--export_attention', action='store_true')
-
-args = parser.parse_args()
-
-num_batch = args.num_batch
-num_epochs = 100
-
-df = pd.read_csv(base_path + 'concat_waveform_new.csv', index_col=0)
-
-samples = df.copy()
-samples['label'] = 'Noise'
-As = df[df['label'] == 'A'].copy()
-Bs = df[(df['label'] == 'B')&(df['its'].isnull())].copy()
-df = pd.concat([As, Bs, samples])
-df = df.sample(frac=1, random_state=0)
-df = df.reset_index(drop=True)
-print(len(df))
-
-datasets = PhaseDataset(df)
-train_size = int(0.8 * len(datasets))
-indices = np.arange(len(datasets))
-
-# 学習用
-train_dataset = Subset(datasets, indices[:train_size])
-# 評価用
-test_dataset = Subset(datasets, indices[train_size:])
-
-# データローダー
-train_dataloader = DataLoader(
-    train_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Evaluate a trained model checkpoint.")
+    parser.add_argument("num_batch", type=int, help="Mini-batch size.")
+    parser.add_argument("window_size", type=int, help="Convolution window size.")
+    parser.add_argument("stride", type=int, help="Convolution stride.")
+    parser.add_argument("channel_size", type=int, help="Convolution output channels.")
+    parser.add_argument(
+        "--weight",
+        default="weights/attn_rpr_weight_w50s10c150_1702451247.3488655.pth",
+        help="Checkpoint file path.",
     )
-test_dataloader = DataLoader(
-    test_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+    parser.add_argument(
+        "--data-csv",
+        default="data/concat_waveform_new.csv",
+        help="Metadata CSV path.",
     )
-val_dataloader = DataLoader(
-    test_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+    parser.add_argument("--data-dir", default="data", help="Directory containing npz files.")
+    parser.add_argument("--workers", type=int, default=0, help="DataLoader workers.")
+    return parser.parse_args()
+
+
+def build_eval_loader(df: pd.DataFrame, batch_size: int, workers: int, data_dir: str) -> DataLoader:
+    dataset = PhaseDataset(df, data_dir=data_dir, is_eval=True)
+    split = int(0.8 * len(dataset))
+    indices = np.arange(len(dataset))
+    test_dataset = Subset(dataset, indices[split:])
+    return DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=workers,
+        pin_memory=torch.cuda.is_available(),
     )
 
-class MyModelRPR(nn.Module):
-    def __init__(self, window_size=50, channel_size=150, stride=10):
-        super(MyModelRPR, self).__init__()
-        self.convlayers1 = nn.Sequential(
-            nn.Conv1d(3, channel_size, window_size, stride=stride),
-            nn.BatchNorm1d(channel_size),
-            nn.ReLU(),
-        )
-        self.linear1 = nn.Linear(3, channel_size)
-        self.encoder = TransformerEncoder(channel_size, 10, 2048, 3)
-        self.do = nn.Dropout(0.1)
-        self.rl = nn.ReLU()
-        self.linear2 = nn.Linear(channel_size, 3)
 
-    def forward(self, src):
-        b, _, _ = src.shape
-        x = src.permute(0, 2, 1)
-        x = self.convlayers1(x)
-        x = self.do(x)
-        x = x.permute(0, 2, 1)
-        cls_token = torch.randn((x.size(0), 1, x.size(2))).to(x.device)
-        x = torch.cat((cls_token, x), dim=1)
-        x, attn_list = self.encoder(x)
-        x = x[:, 0, :]
-        x = x.view(x.size(0), -1)
-        x = self.rl(x)
-        x = self.do(x)
-        x = self.linear2(x)
-
-        return x, attn_list
-
-
-def fix_model_state_dict(state_dict):
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k
-        if name.startswith('module.'):
-            name = name[7:]
-        new_state_dict[name] = v
-    return new_state_dict
-
-def plot_result(model, dataloader, device):
+def collect_predictions(model: torch.nn.Module, dataloader: DataLoader, device: torch.device):
     model.eval()
-    all_preds = torch.tensor([], dtype=torch.long, device=device)
-    all_targets = torch.tensor([], dtype=torch.long, device=device)
-    with torch.no_grad():
-        for src, tgt in dataloader:
-            src = src.to(device)
-            tgt = tgt.to(device)
-            output, attn = model(src)
-            all_preds = torch.cat([all_preds, output.argmax(dim=1)])
-            all_targets = torch.cat([all_targets, tgt])
-    return all_preds, all_targets
+    all_preds: list[int] = []
+    all_targets: list[int] = []
 
-if __name__=='__main__':
-    test_model = MyModelRPR().to(device)
-    filename = 'weights/attn_rpr_weight_w50s10c150_1702451247.3488655.pth'
-    print(filename)
-    test_model.load_state_dict(fix_model_state_dict(torch.load(filename)))
-    pred, tgt = plot_result(test_model, test_dataloader, device)
-    print(f'confusion matrix : {confusion_matrix(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'accuracy : {accuracy_score(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'balanced accuracy : {balanced_accuracy_score(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'precision : {precision_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
-    print(f'recall : {recall_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
-    print(f'f1 : {f1_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
+    with torch.no_grad():
+        for src, tgt, *_ in dataloader:
+            src = src.to(device, non_blocking=True)
+            logits, _ = model(src)
+            all_preds.extend(logits.argmax(dim=1).cpu().tolist())
+            all_targets.extend(torch.argmax(tgt, dim=1).tolist())
+
+    return np.array(all_preds), np.array(all_targets)
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    df = pd.read_csv(args.data_csv, index_col=0)
+    samples = df.copy()
+    samples["label"] = "Noise"
+    as_df = df[df["label"] == "A"].copy()
+    bs_df = df[(df["label"] == "B") & (df["its"].isnull())].copy() if "its" in df.columns else df[df["label"] == "B"].copy()
+    eval_df = pd.concat([as_df, bs_df, samples]).sample(frac=1, random_state=0).reset_index(drop=True)
+
+    test_loader = build_eval_loader(eval_df, args.num_batch, args.workers, args.data_dir)
+
+    model = RPRClassifier(
+        window_size=args.window_size,
+        channel_size=args.channel_size,
+        stride=args.stride,
+    ).to(device)
+    checkpoint = torch.load(args.weight, map_location=device)
+    model.load_state_dict(strip_data_parallel_prefix(checkpoint))
+
+    pred, tgt = collect_predictions(model, test_loader, device)
+    print(f"Confusion matrix:\n{confusion_matrix(tgt, pred)}")
+    print(f"Accuracy: {accuracy_score(tgt, pred):.4f}")
+    print(f"Balanced accuracy: {balanced_accuracy_score(tgt, pred):.4f}")
+    print(f"Precision: {precision_score(tgt, pred, average=None, zero_division=0)}")
+    print(f"Recall: {recall_score(tgt, pred, average=None, zero_division=0)}")
+    print(f"F1: {f1_score(tgt, pred, average=None, zero_division=0)}")
+
+
+if __name__ == "__main__":
+    main()

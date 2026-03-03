@@ -1,233 +1,208 @@
-# モジュールのインポート
+from __future__ import annotations
+
+import argparse
+import time
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-# import seaborn as sns
-from torch import nn, optim
 import torch
+from matplotlib import pyplot as plt
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    confusion_matrix,
+    f1_score,
+    precision_score,
+    recall_score,
+)
+from torch import nn, optim
 from torch.utils.data import DataLoader, Subset
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score, accuracy_score, balanced_accuracy_score
-from sklearn.preprocessing import OneHotEncoder
-import time
-import subprocess
-import argparse
-from collections import OrderedDict
-from timm.scheduler import CosineLRScheduler
-from modules.transformer_rpr import *
-from modules.dataset import *
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-weight_path = ''
-
-base_path = 'data/'
+from modules.dataset import PhaseDataset
+from modules.model_rpr import RPRClassifier, strip_data_parallel_prefix
 
 
-parser = argparse.ArgumentParser(description='window size, stride, channel sizeを指定して実行する')
-
-parser.add_argument('num_batch', type=int)
-parser.add_argument('window_size', type=int)
-parser.add_argument('stride', type=int)
-parser.add_argument('channel_size', type=int)
-parser.add_argument('-t', '--is_train', action='store_true')
-parser.add_argument('-c', '--caption')
-
-args = parser.parse_args()
-
-num_batch = args.num_batch
-num_epochs = 100
-
-df = pd.read_csv(base_path + 'concat_waveform_new.csv', index_col=0)
-As = df[(df['label'] == 'A')].copy()
-Bs = df[df['label'] == 'B'].copy()
-samples = df.copy()
-df = pd.concat([As, Bs, samples])
-df = df.sample(frac=1, random_state=0)
-df = df.reset_index(drop=True)
-print(len(df))
-print(df['label'].value_counts())
-
-ohe = OneHotEncoder(categories=[['A', 'B', 'Noise']], sparse=False)
-# df = pd.concat([df, pd.get_dummies(df['label'])], axis=1)
-print(pd.concat([df, pd.DataFrame(ohe.fit_transform([[i] for i in df.label]), columns=['A', 'B', 'Noise'])], axis=1).head())
-
-datasets = PhaseDataset(df)
-train_size = int(0.8 * len(datasets))
-indices = np.arange(len(datasets))
-
-# 学習用
-train_dataset = Subset(datasets, indices[:train_size])
-# 評価用
-test_dataset = Subset(datasets, indices[train_size:])
-
-# データローダー
-train_dataloader = DataLoader(
-    train_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train the Transformer RPR model for volcanic earthquake classification."
     )
-test_dataloader = DataLoader(
-    test_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+    parser.add_argument("num_batch", type=int, help="Mini-batch size.")
+    parser.add_argument("window_size", type=int, help="Convolution window size.")
+    parser.add_argument("stride", type=int, help="Convolution stride.")
+    parser.add_argument("channel_size", type=int, help="Convolution output channels.")
+    parser.add_argument("-t", "--is_train", action="store_true", help="Train for full epochs.")
+    parser.add_argument("-c", "--caption", help="Optional run caption.")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of training epochs.")
+    parser.add_argument("--workers", type=int, default=0, help="DataLoader workers.")
+    parser.add_argument(
+        "--data-csv",
+        default="data/concat_waveform_new.csv",
+        help="Metadata CSV path.",
     )
-val_dataloader = DataLoader(
-    test_dataset,
-    batch_size = num_batch,
-    shuffle = True,
-    # num_workers = os.cpu_count(),
-    num_workers = 9,
-    pin_memory=True,
-    # drop_last=True
+    parser.add_argument("--data-dir", default="data", help="Directory containing npz files.")
+    return parser.parse_args()
+
+
+def build_dataframe(csv_path: str) -> pd.DataFrame:
+    df = pd.read_csv(csv_path, index_col=0)
+    as_df = df[df["label"] == "A"].copy()
+    bs_df = df[df["label"] == "B"].copy()
+    shuffled = pd.concat([as_df, bs_df, df]).sample(frac=1, random_state=0)
+    return shuffled.reset_index(drop=True)
+
+
+def make_loaders(df: pd.DataFrame, batch_size: int, workers: int, data_dir: str):
+    dataset = PhaseDataset(df, data_dir=data_dir)
+    train_size = int(0.8 * len(dataset))
+    indices = np.arange(len(dataset))
+    train_dataset = Subset(dataset, indices[:train_size])
+    eval_dataset = Subset(dataset, indices[train_size:])
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "num_workers": workers,
+        "pin_memory": torch.cuda.is_available(),
+    }
+    return (
+        DataLoader(train_dataset, **loader_kwargs),
+        DataLoader(eval_dataset, **loader_kwargs),
+        DataLoader(eval_dataset, **loader_kwargs),
     )
 
-class MyModelRPR(nn.Module):
-    def __init__(self, window_size=50, channel_size=150, stride=10):
-        super(MyModelRPR, self).__init__()
-        self.convlayers1 = nn.Sequential(
-            nn.Conv1d(3, channel_size, window_size, stride=stride),
-            nn.BatchNorm1d(channel_size),
-            nn.ReLU(),
-        )
-        # self.linear1 = nn.Linear(50, 100)
-        self.linear1 = nn.Linear(3, channel_size)
-        # self.pe = PositionalEncoding(channel_size)
-        self.encoder = TransformerEncoder(channel_size, 10, 2048, 3)
-        self.do = nn.Dropout(0.1)
-        self.rl = nn.ReLU()
-        self.linear2 = nn.Linear(channel_size, 3)
-        # self.cls_token = nn.Parameter(torch.randn(1, 1, args.channel_size))
 
-    def forward(self, src):
-        b, _, _ = src.shape
-        x = src.permute(0, 2, 1)
-        x = self.convlayers1(x)
-        x = self.do(x)
-        x = x.permute(0, 2, 1)
-        # x = self.linear1(x)
-        # x = self.do(x)
-        cls_token = torch.randn((x.size(0), 1, x.size(2))).to(x.device)
-        # cls_tokens = repeat(self.cls_token, '1 1 d -> b 1 d', b = b)
-        x = torch.cat((cls_token, x), dim=1)
-        # x = self.pe(x)
-        x, attn_list = self.encoder(x)
-        x = x[:, 0, :]
-        x = x.view(x.size(0), -1)
-        x = self.rl(x)
-        x = self.do(x)
-        x = self.linear2(x)
-
-        return x, attn_list
-
-# 訓練、推論を行う
-def train(model, dataloader, criterion, optimizer, scheduler):
+def train_epoch(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    optimizer: optim.Optimizer,
+    device: torch.device,
+    single_batch: bool,
+) -> float:
     model.train()
-    total_loss = []
-    for i, (src, tgt) in enumerate(dataloader):
+    losses: list[float] = []
+    for src, tgt in dataloader:
         src = src.to(device, non_blocking=True)
         tgt = tgt.to(device, non_blocking=True)
-        optimizer.zero_grad()
-        output, _ = model(src)
-        loss = criterion(output, torch.argmax(tgt, dim=1))
+        optimizer.zero_grad(set_to_none=True)
+        logits, _ = model(src)
+        loss = criterion(logits, torch.argmax(tgt, dim=1))
         loss.backward()
         optimizer.step()
-        # scheduler.step(i+1)
-        total_loss.append(loss.item())
-        if not args.is_train:
-            subprocess.call(['nvidia-smi'])
+        losses.append(float(loss.item()))
+        if single_batch:
             break
-    return sum(total_loss) / len(total_loss)
+    return float(np.mean(losses))
 
-def evaluate(model, dataloader, criterion):
+
+def evaluate(model: nn.Module, dataloader: DataLoader, criterion: nn.Module, device: torch.device) -> float:
     model.eval()
-    total_loss = []
+    losses: list[float] = []
     with torch.no_grad():
         for src, tgt in dataloader:
             src = src.to(device, non_blocking=True)
             tgt = tgt.to(device, non_blocking=True)
-            output, _ = model(src)
-            loss = criterion(output, torch.argmax(tgt, dim=1))
-            total_loss.append(loss.item())
-    return sum(total_loss) / len(total_loss)
+            logits, _ = model(src)
+            losses.append(float(criterion(logits, torch.argmax(tgt, dim=1)).item()))
+    return float(np.mean(losses))
 
-# 学習を行う
-def run_train(model, train_dataloader, val_dataloader, optimizer, scheduler, criterion, num_epochs, device):
-    train_loss_list = []
-    val_loss_list = []
-    model = torch.nn.DataParallel(model)
-    torch.backends.cudnn.benchmark = True
-    for epoch in range(num_epochs):
-        train_loss = train(model, train_dataloader, criterion, optimizer, scheduler)
-        val_loss = evaluate(model, val_dataloader, criterion)
-        print(f'epoch: {epoch+1}, train_loss: {train_loss}, val_loss: {val_loss}')
-        train_loss_list.append(train_loss)
-        val_loss_list.append(val_loss)
-    # 重みを保存する
-    global weight_path
-    weight_path = f'weights/attn_rpr_weight_w{args.window_size}s{args.stride}c{args.channel_size}_{time.time()}.pth'
-    torch.save(model.module.state_dict(), f'{weight_path}')
-    return train_loss_list, val_loss_list
 
-def fix_model_state_dict(state_dict):
-    new_state_dict = OrderedDict()
-    for k, v in state_dict.items():
-        name = k
-        if name.startswith('module.'):
-            name = name[7:]
-        new_state_dict[name] = v
-    return new_state_dict
-
-def plot_result(model, dataloader, device):
+def collect_predictions(model: nn.Module, dataloader: DataLoader, device: torch.device):
     model.eval()
-    all_preds = torch.tensor([], dtype=torch.long, device=device)
-    all_targets = torch.tensor([], dtype=torch.long, device=device)
+    preds: list[int] = []
+    targets: list[int] = []
     with torch.no_grad():
-        for src, tgt2 in dataloader:
-            src = src.to(device)
-            tgt2 = tgt2.to(device)
-            output1, _ = model(src)
-            all_preds = torch.cat([all_preds, output1.argmax(dim=1)])
-            all_targets = torch.cat([all_targets, tgt2])
+        for src, tgt in dataloader:
+            src = src.to(device, non_blocking=True)
+            logits, _ = model(src)
+            preds.extend(logits.argmax(dim=1).cpu().tolist())
+            targets.extend(torch.argmax(tgt, dim=1).tolist())
+    return np.array(preds), np.array(targets)
 
-    return all_preds, all_targets
 
-if __name__=='__main__':
-    if args.is_train:
-        print('Training')
-    else:
-        print('Debug')
-    print(f'token mean attn rpr w{args.window_size}s{args.stride}c{args.channel_size}')
-    if args.caption != None:
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    if args.caption:
         print(args.caption)
-    model = MyModelRPR().to(device)
-    optimizer = optim.AdamW(model.parameters())
-    scheduler = CosineLRScheduler(optimizer, t_initial=100, lr_min=1e-4, 
-                                  warmup_t=20, warmup_lr_init=5e-5, warmup_prefix=True)
+
+    df = build_dataframe(args.data_csv)
+    print(f"Samples: {len(df)}")
+    print(df["label"].value_counts())
+
+    train_loader, val_loader, test_loader = make_loaders(
+        df, batch_size=args.num_batch, workers=args.workers, data_dir=args.data_dir
+    )
+
+    model = RPRClassifier(
+        window_size=args.window_size,
+        channel_size=args.channel_size,
+        stride=args.stride,
+    ).to(device)
+
     criterion = nn.CrossEntropyLoss()
-    train_loss_list, val_loss_list = run_train(model, train_dataloader, val_dataloader, optimizer, scheduler, criterion, num_epochs, device)
-    print('Finished Training')
+    optimizer = optim.AdamW(model.parameters())
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(args.epochs, 1), eta_min=1e-4)
+
+    if torch.cuda.device_count() > 1:
+        model = torch.nn.DataParallel(model)
+
+    train_losses: list[float] = []
+    val_losses: list[float] = []
+    epochs = args.epochs if args.is_train else 1
+
+    for epoch in range(epochs):
+        train_loss = train_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            single_batch=not args.is_train,
+        )
+        val_loss = evaluate(model, val_loader, criterion, device)
+        scheduler.step()
+
+        train_losses.append(train_loss)
+        val_losses.append(val_loss)
+        print(f"Epoch {epoch + 1}/{epochs} train_loss={train_loss:.6f} val_loss={val_loss:.6f}")
+
+    Path("weights").mkdir(exist_ok=True)
+    Path("plots").mkdir(exist_ok=True)
+    stamp = time.time()
+    weight_path = Path(
+        f"weights/attn_rpr_weight_w{args.window_size}s{args.stride}c{args.channel_size}_{stamp}.pth"
+    )
+    state_dict = model.module.state_dict() if isinstance(model, torch.nn.DataParallel) else model.state_dict()
+    torch.save(state_dict, weight_path)
+    print(f"Saved model: {weight_path}")
+
     plt.figure()
-    plt.plot(train_loss_list, label='train_loss')
-    plt.plot(val_loss_list, label='val_loss')
+    plt.plot(train_losses, label="train_loss")
+    plt.plot(val_losses, label="val_loss")
     plt.legend()
-    plt_time = time.time()
-    plt.savefig(f'plots/loss_w{args.window_size}s{args.stride}c{args.channel_size}_{plt_time}.png')
-    print(f'plot saved loss_w{args.window_size}s{args.stride}c{args.channel_size}_{plt_time}.png')
-    test_model = MyModelRPR().to(device)
-    test_model.load_state_dict(fix_model_state_dict(torch.load(f'{weight_path}')))
-    print(f'model saved {weight_path}')
-    pred, tgt = plot_result(test_model, test_dataloader, device)
-    print(f'confusion matrix : {confusion_matrix(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'accuracy : {accuracy_score(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'balanced accuracy : {balanced_accuracy_score(pred.tolist(), tgt.argmax(dim=1).tolist())}')
-    print(f'precision : {precision_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
-    print(f'recall : {recall_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
-    print(f'f1 : {f1_score(pred.tolist(), tgt.argmax(dim=1).tolist(), average=None)}')
+    plot_path = Path(f"plots/loss_w{args.window_size}s{args.stride}c{args.channel_size}_{stamp}.png")
+    plt.savefig(plot_path)
+    print(f"Saved plot: {plot_path}")
+
+    eval_model = RPRClassifier(
+        window_size=args.window_size,
+        channel_size=args.channel_size,
+        stride=args.stride,
+    ).to(device)
+    loaded = torch.load(weight_path, map_location=device)
+    eval_model.load_state_dict(strip_data_parallel_prefix(loaded))
+
+    pred, tgt = collect_predictions(eval_model, test_loader, device)
+    print(f"Confusion matrix:\n{confusion_matrix(tgt, pred)}")
+    print(f"Accuracy: {accuracy_score(tgt, pred):.4f}")
+    print(f"Balanced accuracy: {balanced_accuracy_score(tgt, pred):.4f}")
+    print(f"Precision: {precision_score(tgt, pred, average=None, zero_division=0)}")
+    print(f"Recall: {recall_score(tgt, pred, average=None, zero_division=0)}")
+    print(f"F1: {f1_score(tgt, pred, average=None, zero_division=0)}")
+
+
+if __name__ == "__main__":
+    main()

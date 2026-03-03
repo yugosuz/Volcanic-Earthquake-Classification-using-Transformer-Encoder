@@ -1,9 +1,83 @@
-# Volcanic-Earthquake-Classification-using-Transformer-Encoder
-Volcanic Earthquake Classification using Transformer Encoder and Its Interpretability Evaluation
-DOI: https://doi.org/10.22541/essoar.171378786.62639546/v1
+# Volcanic Earthquake Classification with Transformer Encoder
 
-- train.py : train code
-- summary.py : show summary
-- weights/* : model weight file
-- stations.csv : station list
-- input data canbe downloaded from https://x.gd/Ro0td
+This repository trains and evaluates a Transformer-based classifier for volcanic earthquake waveform data.
+
+## Repository layout
+
+- `train.py`: training entry point.
+- `summary.py`: evaluation entry point for a saved checkpoint.
+- `modules/dataset.py`: dataset loading and waveform cropping.
+- `modules/model_rpr.py`: Transformer RPR classifier and checkpoint helpers.
+- `modules/transformer_rpr.py`: relative positional attention blocks.
+- `weights/`: pretrained/model checkpoint files.
+- `stations.csv`: station metadata.
+
+## Prerequisites
+
+- Python 3.10+
+- [uv](https://docs.astral.sh/uv/)
+
+## Setup with uv
+
+```bash
+uv sync
+```
+
+`uv sync` installs runtime and development dependencies defined in `pyproject.toml`.
+
+## Data format
+
+By default, scripts expect:
+
+- CSV metadata at `data/concat_waveform_new.csv`
+- waveform files under `data/` referenced by `fname` column
+
+Each waveform `.npz` file should include:
+
+- `data`: array shaped `(N, 3)`
+- `itp`: integer index
+- optional `its`: integer index
+
+CSV should include at least:
+
+- `fname`: `.npz` filename
+- `label`: one of `A`, `B`, `Noise`
+
+## Train
+
+```bash
+uv run train.py 32 50 10 150 -t --epochs 100 --workers 4
+```
+
+Arguments:
+
+- positional: `num_batch window_size stride channel_size`
+- `-t/--is_train`: run full training (without it, script runs one debug batch)
+- `--data-csv`: metadata CSV path (default `data/concat_waveform_new.csv`)
+- `--data-dir`: waveform directory (default `data`)
+- `--epochs`: number of epochs
+- `--workers`: DataLoader workers
+- `-c/--caption`: optional run label
+
+Outputs:
+
+- checkpoint under `weights/`
+- loss plot under `plots/`
+- classification metrics printed to stdout
+
+## Evaluate
+
+```bash
+uv run summary.py 32 50 10 150 --weight weights/your_checkpoint.pth
+```
+
+## Run tests
+
+```bash
+uv run pytest
+```
+
+## Notes
+
+- The original input data link from the paper: https://x.gd/Ro0td
+- DOI: https://doi.org/10.22541/essoar.171378786.62639546/v1

@@ -81,3 +81,24 @@ uv run pytest
 
 - The original input data link from the paper: https://x.gd/Ro0td
 - DOI: https://doi.org/10.22541/essoar.171378786.62639546/v1
+
+## Generate synthetic test data
+
+You can generate a small synthetic dataset to validate the training/evaluation pipeline.
+
+```bash
+uv run python tools/generate_mock_data.py
+```
+
+Then run a debug training pass (1 epoch, 1 training batch):
+
+```bash
+uv run train.py 8 50 10 150 --data-csv data/mock_concat_waveform_new.csv --data-dir data/mock_npz --workers 0
+```
+
+Run evaluation with the latest checkpoint:
+
+```bash
+LATEST=$(ls -t weights/attn_rpr_weight_w50s10c150_*.pth | head -n 1)
+uv run summary.py 8 50 10 150 --data-csv data/mock_concat_waveform_new.csv --data-dir data/mock_npz --weight "$LATEST" --workers 0
+```
